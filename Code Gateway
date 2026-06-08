@@ -1,0 +1,121 @@
+#define BLYNK_TEMPLATE_ID   "TMPL6hGZvOa-Q"
+#define BLYNK_TEMPLATE_NAME "iot gateway"
+#define BLYNK_AUTH_TOKEN    "P0kPTW7ALb2K6GzmWh1ULqAVUlaDyytu"
+
+// --- KHAI BÁO THƯ VIỆN HỆ THỐNG ESP32 (BẮT BUỘC) ---
+#include <WiFi.h>
+#include <WiFiClientSecure.h> 
+#include <HTTPClient.h>       
+#include <BlynkSimpleEsp32.h>
+
+// --- CẤU HÌNH MẠNG ---
+char ssid[] = "TP-LINK_BEF2";
+char pass[] = "56108606";
+
+// --- CẤU HÌNH GOOGLE SHEETS (HAI BIẾN BỊ LỖI NẰM Ở ĐÂY NÀY) ---
+// Nhớ thay chuỗi AKfycb... bằng ID Deployment thật của cậu!
+const char* googleScriptDeploymentId = "AKfycbzfepnFUC0BtU_MIAtC6xOf60oFJfgeNj383vBE8IFWFmH-qG-nrq3hvRhEIPypfWGz"; 
+const char* googleHost = "script.google.com";
+
+// --- CẤU HÌNH UART ---
+#define RX2_PIN 16
+#define TX2_PIN 17
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Cấu hình UART2 tốc độ 115200 để đồng bộ với con S3
+  Serial2.begin(115200, SERIAL_8N1, RX2_PIN, TX2_PIN);
+  
+  Serial.println("\n--- KHOI TAO HE THONG IOT GATEWAY ---");
+  
+  // Kết nối WiFi
+  WiFi.begin(ssid, pass);
+  Serial.print("Dang ket noi Wi-Fi...");
+}
+
+void loop() {
+  // Kiểm tra Wi-Fi ngầm, nếu kết nối thành công thì mới chạy Blynk
+  if (WiFi.status() == WL_CONNECTED) {
+    static bool blynkInitialized = false;
+    if (!blynkInitialized) {
+      Blynk.config(BLYNK_AUTH_TOKEN);
+      Blynk.connect();
+      blynkInitialized = true;
+      Serial.println("\n[+] Wi-Fi va Blynk da thong suot!");
+    }
+    Blynk.run();
+  } else {
+    // Nếu mất mạng, in dấu chấm để cảnh báo nhưng KHÔNG khóa chip
+    static unsigned long lastDot = 0;
+    if (millis() - lastDot > 1000) {
+      Serial.print(".");
+      lastDot = millis();
+    }
+  }
+  
+  // ----- LUÔN LUÔN LẮNG NGHE S3 (KHÔNG BỊ CHẶN BỞI MẠNG) -----
+  if (Serial2.available()) {
+    String incomingData = Serial2.readStringUntil('\n');
+    incomingData.trim();
+    
+    // Log ra để xem Gateway đã nhận được tín hiệu chưa
+    Serial.print("[UART] Nhan tu S3 -> ");
+    Serial.println(incomingData);
+    
+    if (incomingData.startsWith("W:")) {
+      float currentWeight = incomingData.substring(2).toFloat();
+      if (WiFi.status() == WL_CONNECTED && Blynk.connected()) {
+        Blynk.virtualWrite(V0, currentWeight);
+      }
+    }
+    else if (incomingData.startsWith("L:")) {
+      float lockedWeight = incomingData.substring(2).toFloat();
+      
+      if (WiFi.status() == WL_CONNECTED && Blynk.connected()) {
+        Blynk.virtualWrite(V0, lockedWeight);
+      }
+      
+      Serial.println("\n[🔔] NHẬN ĐƯỢC LỆNH CHỐT SỐ TỪ S3! TIẾN HÀNH BẮN GOOGLE SHEETS...");
+      sendToGoogleSheet(lockedWeight);
+    }
+  }
+}
+
+// --- HÀM GỬI LÊN SHEET ---
+void sendToGoogleSheet(float weight) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[X] Loi: Mat Wi-Fi, khong the ban len Sheet!");
+    return;
+  }
+  
+  WiFiClientSecure client;
+  client.setInsecure(); 
+  HTTPClient http;
+  
+  String url = "https://" + String(googleHost) + "/macros/s/" + String(googleScriptDeploymentId) + "/exec?weight=" + String(weight, 3);
+  
+  Serial.print("-> Dang goi URL: ");
+  Serial.println(url);
+  
+  if (http.begin(client, url)) {
+    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+    int httpCode = http.GET();
+    
+    if (httpCode > 0) {
+      Serial.printf("[+] Day Sheets thanh cong! Ma Code: %d\n", httpCode);
+      Serial.println("-> Phan hoi: " + http.getString());
+    } else {
+      Serial.printf("[X] Loi HTTP Request, Ma loi: %s\n", http.errorToString(httpCode).c_str());
+    }
+    http.end();
+  }
+}
+BLYNK_WRITE(V1) {
+  if (param.asInt() == 1) { // Nếu nút được bấm
+    Serial.println("[Blynk] Nhan lenh TARE tu Server, dang gui ve S3...");
+    
+    // Gửi lệnh qua UART ngược về MCU (S3)
+    Serial2.println("CMD:TARE"); 
+  }
+}
