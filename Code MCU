@@ -1,0 +1,162 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include "HX711.h"
+
+// ===== CẤU HÌNH OLED =====
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define SDA_PIN 8
+#define SCL_PIN 9
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// ===== CẤU HÌNH HX711 =====
+const int LOADCELL_DOUT_PIN = 4;
+const int LOADCELL_SCK_PIN = 5;
+HX711 scale;
+float calibration_factor = 100.09; // Thay đổi hệ số của bạn vào đây
+
+// ===== CẤU HÌNH UART (Gửi sang Gateway) =====
+#define RX1_PIN 18
+#define TX1_PIN 17
+
+unsigned long lastSendTime = 0;
+float filtered_weight_kg = 0;
+bool isWeightLocked = false;       // Cờ trạng thái chốt số
+float lockedWeightKg = 0;          // Lưu giá trị sau khi chốt
+unsigned long stableStartTime = 0; // Bộ đếm thời gian ổn định
+float previousWeightKg = 0;        // Khối lượng ở chu kỳ đọc trước đó
+bool hasSentLocked = false;
+void setup() {
+  Serial.begin(115200); // Debug máy tính
+  
+  // Khởi tạo UART1 gửi dữ liệu sang ESP32 Gateway (Baudrate 9600)
+  Serial1.begin(115200, SERIAL_8N1, RX1_PIN, TX1_PIN);
+
+  // Khởi tạo I2C cho OLED
+  Wire.begin(SDA_PIN, SCL_PIN);
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println(F("OLED khong ket noi!"));
+    for(;;);
+  }
+  display.clearDisplay();
+  display.setTextColor(WHITE);
+
+  // Khởi tạo cân
+  scale.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
+  scale.set_scale(calibration_factor);
+  scale.tare(); 
+  
+  display.setCursor(0, 10);
+  display.setTextSize(1);
+  display.print("Khoi dong xong...");
+  display.display();
+  delay(1000);
+}
+
+unsigned long lastOledUpdate = 0; // Thêm biến đếm cho OLED
+
+void loop() {
+  if (scale.is_ready()) {
+    // SỬA LỖI 2: Chỉ lấy 1 mẫu để tránh Blocking vòng lặp
+    float raw_weight = scale.get_units(1); 
+    
+    // 1. Lọc nhiễu trung bình mũ (EMA)
+    filtered_weight_kg = (0.15 * (raw_weight / 1000.0)) + (0.85 * filtered_weight_kg);
+    
+    // 2. Thuật toán Dải chết (Lấy sạch đồ ra -> Về 0 -> Tự mở khóa)
+    if (filtered_weight_kg < 0.005) { 
+      filtered_weight_kg = 0; 
+      isWeightLocked = false;
+      stableStartTime = millis();
+      previousWeightKg = filtered_weight_kg;
+    } 
+    // 3. Đang chưa khóa -> Đợi ổn định 1 giây để Khóa số
+    else if (!isWeightLocked) {
+      // SỬA LỖI 3: Dùng fabs() cho kiểu float
+      if (fabs(filtered_weight_kg - previousWeightKg) <= 0.002) { 
+        if (millis() - stableStartTime > 1000) {
+          isWeightLocked = true;           
+          lockedWeightKg = filtered_weight_kg; 
+        }
+      } else {
+        stableStartTime = millis();
+        previousWeightKg = filtered_weight_kg;
+      }
+    }
+    // 4. Đang bị khóa -> Bị đặt THÊM hoặc RÚT BỚT đồ (Lệch > 50g) -> Tự mở khóa
+    else {
+      // SỬA LỖI 3: Dùng fabs() cho kiểu float
+if (fabs(filtered_weight_kg - lockedWeightKg) > 0.050) {
+        isWeightLocked = false; 
+        stableStartTime = millis();
+        previousWeightKg = filtered_weight_kg;
+      }
+    }
+
+    // Lấy số liệu cuối cùng
+    float final_weight = isWeightLocked ? lockedWeightKg : filtered_weight_kg;
+
+    // ----- SỬA LỖI 1: TẠO TIMER RIÊNG CHO OLED (Cập nhật mỗi 200ms) -----
+    if (millis() - lastOledUpdate > 200) {
+      display.clearDisplay();
+      display.setTextSize(2);
+      display.setCursor(0, 20);
+      display.print("W: ");
+      display.print(final_weight, 3);
+      display.print(" kg");
+      
+      if (isWeightLocked) {
+        display.print(" *"); // Báo hiệu đã chốt
+      }
+      display.display();
+      lastOledUpdate = millis(); // Reset timer OLED
+    
+    }
+    // ----- GỬI SANG GATEWAY -----
+    // ----- GỬI SANG GATEWAY (Nằm trong loop của ESP32-S3) -----
+    if (millis() - lastSendTime > 500) {
+      
+      // TRƯỜNG HỢP 1: Khối lượng đang dao động (Chưa chốt)
+      if (!isWeightLocked) {
+        Serial1.print("W:");
+        Serial1.println(final_weight, 3);
+        
+        // Đảm bảo cờ gửi luôn tắt khi cân đang nhảy số
+        hasSentLocked = false; 
+      } 
+      
+      // TRƯỜNG HỢP 2: Vừa chốt số xong -> Bắn 1 phát duy nhất rồi khóa mõm
+      else if (isWeightLocked && hasSentLocked == false) {
+        Serial1.print("L:"); 
+        Serial1.println(final_weight, 3);
+        
+        Serial.println(">>> DA GUI LENH CHOT SO (L:) SANG GATEWAY. DUNG GUI NUA! <<<");
+        
+        // CHỐT TỬ: Bật cờ này lên true để chu kỳ sau không bao giờ lọt vào đây nữa
+        hasSentLocked = true; 
+      }
+      
+      // (Không có trường hợp 3, nếu isWeightLocked = true và hasSentLocked = true thì nó im lặng đi qua)
+
+      lastSendTime = millis();
+      // ----- NHẬN LỆNH TỪ GATEWAY GỬI NGƯỢC LẠI -----
+    if (Serial1.available()) {
+      String gwCommand = Serial1.readStringUntil('\n');
+      gwCommand.trim();
+      
+      if (gwCommand == "CMD:TARE") {
+        Serial.println(">> DA NHAN LENH RESET CAN TU SERVER!");
+        
+        // Thực thi lệnh từ Server: Reset cân về 0
+        scale.tare(); 
+        
+        // Mở lại các cờ trạng thái để cân tiếp
+        isWeightLocked = false; 
+        hasSentLocked = false;  
+        filtered_weight_kg = 0;
+      }
+    }
+    }
+ 
