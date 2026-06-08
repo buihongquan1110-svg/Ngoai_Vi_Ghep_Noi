@@ -1,0 +1,88 @@
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+import google.generativeai as genai
+import pandas as pd
+import time
+
+# ==========================================
+# PHẦN 1: KẾT NỐI GOOGLE SHEETS
+# ==========================================
+def connect_sheets():
+    try:
+        # Đường dẫn đến file chìa khóa JSON (phải để cùng thư mục)
+        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+        creds = ServiceAccountCredentials.from_json_keyfile_name("service_account.json", scope)
+        client = gspread.authorize(creds)
+        
+        # CHỖ NÀY: Điền chính xác tên file Google Sheets của bạn
+        sheet = client.open("Cân điện tử").sheet1 
+        return sheet
+    except Exception as e:
+        print(f"Lỗi kết nối Sheets: {e}")
+        return None
+
+# ==========================================
+# PHẦN 2: CẤU HÌNH AI GEMINI
+# ==========================================
+# CHỖ NÀY: Dán cái API Key bạn lấy từ Google AI Studio vào đây
+API_KEY_GEMINI = "AIzaSyC-rO4k2fey8Eg7j_GtbxKdFhJKKsR0kXE"
+
+genai.configure(api_key=API_KEY_GEMINI)
+model = genai.GenerativeModel('models/gemini-3.1-flash-lite')
+
+# ==========================================
+# PHẦN 3: VÒNG LẶP GIÁM SÁT VÀ PHÂN TÍCH
+# ==========================================
+def start_monitoring():
+    sheet = connect_sheets()
+    if not sheet: return
+
+    print(">>> Hệ thống AI đang bắt đầu giám sát trạm cân...")
+    
+    # Lấy số dòng hiện tại để biết khi nào có dữ liệu mới
+    last_row_count = len(sheet.get_all_records())
+
+    while True:
+        try:
+            records = sheet.get_all_records()
+            current_row_count = len(records)
+
+            # Nếu số dòng tăng lên => Có người vừa cân và chốt số (L:)
+            if current_row_count > last_row_count:
+                print("\n[!] Phát hiện vật phẩm mới trên cân!")
+                
+                # Lấy dữ liệu mới nhất (dòng cuối cùng)
+                df = pd.DataFrame(records)
+                latest_data = df.tail(1).to_string(index=False)
+
+                # Ra lệnh cho AI phân tích
+                prompt = f"""
+                Dưới đây là dữ liệu mới nhất từ trạm cân IoT:
+                {latest_data}
+                
+                Hãy đóng vai trò là chuyên gia phân tích:
+                1. Khối lượng lần này là bao nhiêu?
+                2. So sánh với các lần cân trước (nếu có) xem có bất thường không?
+                3. Dự đoán vật phẩm dựa trên khối lượng (vd: linh kiện, thuốc, hay điện thoại).
+                4. Cảnh báo nếu số liệu quá nhỏ hoặc có dấu hiệu nhiễu.
+                Trả lời súc tích bằng tiếng Việt.
+                """
+response = model.generate_content(prompt)
+                
+                print("-" * 50)
+                print("KẾT QUẢ AI PHÂN TÍCH:")
+                print(response.text)
+                print("-" * 50)
+                
+                # Cập nhật lại số dòng để chờ lần cân tiếp theo
+                last_row_count = current_row_count
+            
+            # Đợi 10 giây rồi kiểm tra Sheets lại một lần
+            time.sleep(10)
+
+        except Exception as e:
+            print(f"Có lỗi xảy ra: {e}")
+            time.sleep(5)
+
+if __name__ == "__main__":
+    start_monitoring()
